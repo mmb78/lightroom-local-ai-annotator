@@ -8,7 +8,7 @@ return {
     -- The path to your conda activation script. 
     -- If you use standard Python, you can leave this blank ("") and the batch 
     -- script will just try to run "python" directly from your global PATH.
-    condaActivatePath = "C:\\YOUR\\PATH\\miniconda3\\Scripts\\activate", 	-- REPLACE WITH YOUR OWN!
+    condaActivatePath = "C:\\Users\\<YOURNAME>\\miniconda3\\Scripts\\activate",
     
     -- The name of the conda environment where you installed your dependencies.
     condaEnvName = "base",
@@ -16,7 +16,7 @@ return {
 	-- Directory and Cache Names
     imageCacheDirName = "_Cache_Data/Images",
     geoCacheDirName = "_Cache_Data/GeoCode",
-    batchFolderPrefix = "LLM_Batch_",
+    batchFolderPrefix = "_Cache_Data/LLM/Batch_",
 
 	-- true: Always export fresh JPEGs, overwriting the cache. false: Use cached JPEGs if available.
     defaultForceReexport = false,

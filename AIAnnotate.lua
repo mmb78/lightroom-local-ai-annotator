@@ -103,10 +103,13 @@ LrTasks.startAsyncTask(function()
                 f:popup_menu {
                     value = LrView.bind 'exportSize',
                     items = {
-                        { title = "Small (1024px, 60% Quality)", value = 1024 },
-                        { title = "Medium (1600px, 60% Quality)", value = 1600 },
-                        { title = "Gemma4 (1920px, 70% Quality)", value = 1920 },
-                        { title = "High (3000px, 80% Quality)", value = 3000 },
+                        { title = "Small (1024px, 50% Quality)", value = 1024 },
+                        { title = "Medium (1600px, 50% Quality)", value = 1600 },
+                        { title = "Gemma4 (1920px, 60% Quality)", value = 1920 },
+                        { title = "Qwen3.6 (1680px, 60% Quality)", value = 1680 },
+                        { title = "Qwen3.6 (2520px, 60% Quality)", value = 2520 },
+                        { title = "Qwen3.6 (3780px, 60% Quality)", value = 3780 },
+                        { title = "Qwen3.6 (5040px, 60% Quality)", value = 5040 },
                     }
                 }
             },
@@ -226,8 +229,8 @@ LrTasks.startAsyncTask(function()
 
         local currentRes = prefs.exportSize or 1920
         local quality = 0.6
-        if currentRes == 1920 then quality = 0.7 end
-        if currentRes == 3000 then quality = 0.8 end
+        if currentRes == 1024 then quality = 0.5 end
+        if currentRes == 1600 then quality = 0.5 end
 
         local photosNeedingExport = {}
         local manifestData = {}
@@ -272,6 +275,9 @@ LrTasks.startAsyncTask(function()
                 LR_export_useSubfolder = false,
                 LR_collisionHandling = "rename",
                 LR_renamingTokensOn = false,
+				LR_embeddedMetadataOption = "all",
+                LR_removeLocationMetadata = false,
+                LR_minimizeEmbeddedMetadata = false,
             }
 
             local exportSession = LrExportSession { photosToExport = exportArray, exportSettings = exportSettings }
@@ -359,7 +365,9 @@ LrTasks.startAsyncTask(function()
         end
         
         -- Chain the exit command on the same line using &
-		batFile:write(string.format('python "%s" --batch_dir "%s" --root_temp "%s" --geo_cache_dir "%s" --workers %d --geocode %d --skip_existing_geo %d & exit\n', prefs.pythonScriptPath, safeBatchPath, safeRootTemp, geoCacheDir, prefs.parallelWorkers, geoFlag, skipGeoFlag))
+--		batFile:write(string.format('python "%s" --batch_dir "%s" --root_temp "%s" --geo_cache_dir "%s" --workers %d --geocode %d --skip_existing_geo %d & exit\n', prefs.pythonScriptPath, safeBatchPath, safeRootTemp, geoCacheDir, prefs.parallelWorkers, geoFlag, skipGeoFlag))
+
+		batFile:write(string.format('python "%s" --batch_dir "%s" --root_temp "%s" --geo_cache_dir "%s" --workers %d --geocode %d --skip_existing_geo %d & pause\n', prefs.pythonScriptPath, safeBatchPath, safeRootTemp, geoCacheDir, prefs.parallelWorkers, geoFlag, skipGeoFlag))
 
         batFile:close()
 
@@ -449,27 +457,61 @@ LrTasks.startAsyncTask(function()
                             photo:setRawMetadata("descriptionWriter", modelName) 
                         end
                         
-                        if keywordsStr and keywordsStr ~= "" then
-                            for kw in string.gmatch(keywordsStr, "([^;]+)") do
-                                kw = kw:match("^%s*(.-)%s*$")
-                                if kw ~= "" then
-                                    -- Check local RAM cache first
-                                    local keywordObj = cachedKeywords[kw]
+						
+						if keywordsStr and keywordsStr ~= "" then
+						
+						-- [NEW FIX] Clear old keywords if Overwrite is checked
+                            if prefs.overwriteExisting then
+                                local existingKws = photo:getRawMetadata("keywords")
+                                if existingKws and #existingKws > 0 then
+                                    for _, oldKw in ipairs(existingKws) do
+                                        photo:removeKeyword(oldKw)
+                                    end
+                                end
+                            end
+							
+                            -- 1. Split the LLM output by semicolon to get each full path
+                            for kw_path in string.gmatch(keywordsStr, "([^;]+)") do
+                                kw_path = kw_path:match("^%s*(.-)%s*$") -- Trim whitespace
+                                
+                                if kw_path ~= "" then
+                                    local parentObj = nil
+                                    local currentKeywordObj = nil
+                                    local currentPathKey = ""
                                     
-                                    -- If not in cache, ask Lightroom for it, then cache it
-                                    if not keywordObj then
-                                        keywordObj = catalog:createKeyword(kw, {}, true, nil, true)
-                                        cachedKeywords[kw] = keywordObj
+                                    -- 2. Split the individual path by the pipe '|' character
+                                    for node in string.gmatch(kw_path, "([^|]+)") do
+                                        node = node:match("^%s*(.-)%s*$") -- Trim whitespace around the word
+                                        
+                                        -- Build a unique cache key (e.g., "Nature|Flora|Tree")
+                                        if currentPathKey == "" then
+                                            currentPathKey = node
+                                        else
+                                            currentPathKey = currentPathKey .. "|" .. node
+                                        end
+                                        
+                                        -- Check local RAM cache first for speed
+                                        currentKeywordObj = cachedKeywords[currentPathKey]
+                                        
+                                        -- If not in cache, create it (or fetch it) in Lightroom
+                                        if not currentKeywordObj then
+                                            -- syntax: createKeyword(name, synonyms, includeOnExport, parentKeyword, returnExisting)
+                                            currentKeywordObj = catalog:createKeyword(node, {}, true, parentObj, true)
+                                            cachedKeywords[currentPathKey] = currentKeywordObj
+                                        end
+                                        
+                                        -- Set the current object as the parent for the NEXT level down
+                                        parentObj = currentKeywordObj
                                     end
                                     
-                                    -- Apply to photo
-                                    if keywordObj then
-                                        photo:addKeyword(keywordObj)
+                                    -- 3. Apply the final (deepest) keyword to the photo
+                                    if currentKeywordObj then
+                                        photo:addKeyword(currentKeywordObj)
                                     end
                                 end
                             end
                         end
-                        
+						                        
                         appliedCount = appliedCount + 1
                     end
                 end
@@ -484,15 +526,15 @@ LrTasks.startAsyncTask(function()
             bgProgress:done()
             
             -- Report the exact outcome comparing total exported to total applied
-            LrTasks.startAsyncTask(function()
-                if appliedCount == totalPhotos then
-                    LrDialogs.message("Success!", string.format("All %d photo(s) were successfully annotated!", appliedCount))
-                elseif appliedCount > 0 then
-                    LrDialogs.message("Partial Success / Interrupted", string.format("%d out of %d photo(s) were exported, but only %d were annotated. (Process may have been stopped early)", totalPhotos, totalPhotos, appliedCount))
-                else
-                    LrDialogs.message("Notice", string.format("0 out of %d exported photo(s) were annotated. Process was likely stopped before completing any.", totalPhotos))
-                end
-            end)
+			LrTasks.startAsyncTask(function()
+            if appliedCount == totalPhotos then
+                LrDialogs.showBezel(string.format("AI Annotator: All %d photo(s) annotated!", appliedCount))
+            elseif appliedCount > 0 then
+                LrDialogs.message("Partial Success / Interrupted", string.format("%d out of %d photo(s) were exported, but only %d were annotated.", totalPhotos, totalPhotos, appliedCount))
+            else
+                LrDialogs.message("Notice", string.format("0 out of %d exported photo(s) were annotated.", totalPhotos))
+            end
         end)
+        end, { timeout = 30 })
     end)
 end)

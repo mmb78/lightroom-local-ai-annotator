@@ -8,7 +8,7 @@ import csv
 import argparse
 import sqlite3
 from geopy.geocoders import Nominatim
-from filelock import FileLock
+from filelock import FileLock, Timeout
 import time
 from pydantic import BaseModel
 from datetime import datetime
@@ -17,19 +17,30 @@ from tqdm import tqdm
 # Import user configuration
 import config
 
+
 # ==========================================
 # INITIALIZATION 
 # ==========================================
-if config.LOCAL_LLM == 1:
-    # Use AsyncOpenAI instead of standard OpenAI
+
+# Load the active profile from config
+active_profile = config.LLM_PROFILES[config.ACTIVE_LLM_PROFILE]
+llm_model = active_profile["model"]
+
+print(f"Initializing LLM with profile: {active_profile['name']} ({llm_model})")
+
+# If the profile has a custom base_url (Local/Remote server)
+if active_profile.get("base_url"):
     client = AsyncOpenAI(
-        base_url=config.BASE_URL,
-        api_key='local-llm-key' # Required by the standard, but unused by local servers
+        base_url=active_profile["base_url"],
+        api_key=active_profile["api_key"],
+        timeout=600.0
     )
-    llm_model = config.LOCAL_LLM_MODEL
+# If base_url is None (Official OpenAI API)
 else:
-    client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
-    llm_model = config.OPENAI_FALLBACK_MODEL
+    client = AsyncOpenAI(
+        api_key=active_profile["api_key"],
+        timeout=600.0
+    )
 
 async def safe_print(msg, lock):
     """Safely prints above the tqdm progress bar without breaking it."""
@@ -45,6 +56,7 @@ class ImageDescription(BaseModel):
     keywords: list[str]
 
 schema = ImageDescription.model_json_schema()
+schema["additionalProperties"] = False
 
 def init_geo_db(db_path):
     conn = sqlite3.connect(db_path, timeout=15.0)
@@ -99,7 +111,23 @@ def save_location_to_db(db_path, lat, lon, geo_data):
           geo_data.get("state", ""), geo_data.get("country", "")))
     conn.commit()
     conn.close()
-    
+
+# ==========================================
+# HELPER FUNCTIONS
+# ==========================================
+
+def sanitize_for_tsv(text):
+    """
+    Removes tabs, newlines, and carriage returns that break TSV alignment.
+    Also strips leading/trailing whitespace.
+    """
+    if not text:
+        return ""
+    # Convert to string to handle potential non-string types safely
+    text = str(text)
+    # Replace all illegal TSV characters with a single space
+    return text.replace('\t', ' ').replace('\n', ' ').replace('\r', ' ').strip()
+
 # ==========================================
 # CORE LLM FUNCTIONS
 # ==========================================
@@ -111,6 +139,7 @@ async def read_and_encode_image(image_path):
 
 async def analyze_image(image_path, seed, date_time, address):
     try:
+        # 1. Read the image and build the messages payload FIRST
         encoded_image = await read_and_encode_image(image_path)
         messages = [
             {"role": "system", "content": config.SYSTEM_PROMPT},
@@ -128,34 +157,44 @@ async def analyze_image(image_path, seed, date_time, address):
             }
         ]
 
+        # Add Exif context
         if date_time and address:
             exif_info = config.EXIF_PROMPT_FULL.format(date_time=date_time, address=address)
             messages[1]["content"].append({"type": "text", "text": exif_info})
         elif date_time and not address:
             exif_info = config.EXIF_PROMPT_DATE_ONLY.format(date_time=date_time)
             messages[1]["content"].append({"type": "text", "text": exif_info})
-        
-        # Await the API call using strict Structured Outputs (JSON Schema)
-        response = await client.chat.completions.create(
-            model=llm_model,
-            messages=messages,
-            temperature=config.LLM_TEMPERATURE, 
-            top_p=config.LLM_TOP_P, 
-            seed=seed, 
-            max_tokens=config.MAX_TOKENS,
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "image_description_schema",
-                    "strict": True,
-                    "schema": schema
-                }
+
+        # 2. NOW build the dynamic API arguments using those messages
+        api_args = active_profile["api_params"].copy()
+        api_args["model"] = llm_model
+        api_args["messages"] = messages
+        api_args["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "image_description_schema",
+                "strict": True,
+                "schema": schema
             }
-        )
+        }
+        
+        # 3. Conditionally inject the seed
+        if "seed" in api_args:
+            api_args["seed"] = seed
+
+        # 4. Await the API call by completely unpacking the dictionary
+        response = await client.chat.completions.create(**api_args)
+
+        # Capture the raw string immediately so we can pass it out
+        raw_dump = response.model_dump_json(indent=4)
 
         # With Structured Outputs, the answer is always guaranteed to be in the message content
-        assistant_response = response.choices[0].message.content
+        assistant_response = response.choices[0].message.content            
 
+        # Safeguard against models that run out of breath and return nothing
+        if assistant_response is None:
+            raise ValueError("The server returned a blank response. It likely ran out of tokens while reasoning.")
+            
         try:
             llm_answer = json.loads(assistant_response)
             image_description = ImageDescription(**llm_answer)
@@ -169,7 +208,8 @@ async def analyze_image(image_path, seed, date_time, address):
                 "Keywords": image_description.keywords,
                 "Notes": "Structured Output successful.",
                 "messages": messages,
-                "assistant_response": assistant_response
+                "assistant_response": assistant_response,
+                "raw_dump": raw_dump
             }
         except Exception as e:
             # Failsafe for extreme server-side crashes or parsing issues
@@ -182,7 +222,8 @@ async def analyze_image(image_path, seed, date_time, address):
                 "Keywords": [], 
                 "Notes": f"Error parsing guaranteed JSON: {e}. Raw: {assistant_response}", 
                 "messages": messages, 
-                "assistant_response": assistant_response
+                "assistant_response": assistant_response,
+                "raw_dump": raw_dump
             }
 
     except Exception as e:
@@ -196,19 +237,23 @@ async def summarize_keywords(keywords_str, seed):
             {"role": "system", "content": config.SUMMARIZE_SYSTEM_PROMPT},
             {"role": "user", "content": prompt}
         ]
+        
+        # --- DYNAMIC API ARGUMENTS ---
+        api_args = active_profile["api_params"].copy()
+        api_args["model"] = llm_model
+        api_args["messages"] = messages
+        api_args["temperature"] = 0.5 
+        api_args["top_p"] = 0.5
+        
+        if "seed" in api_args:
+            api_args["seed"] = seed
+
         # Await the API call
-        response = await client.chat.completions.create(
-            model=llm_model,
-            messages=messages,
-            temperature=0.5, 
-            top_p=0.5,
-            seed=seed,
-            max_tokens=100
-        )
+        response = await client.chat.completions.create(**api_args)
+
         return {"Keywords": response.choices[0].message.content}
     except Exception as e:
         return {"Keywords": f"Error {e} while shortening keywords."}
-
 
 in_flight = {} # Tracks coordinates currently being processed
 
@@ -227,7 +272,7 @@ async def reverse_geocode_async(lat, lon, geo_lock, console_lock, db_path):
     # 1. Check SQLite Database using HIGH-PRECISION RANGE
     cached_geo = await asyncio.to_thread(get_cached_location, db_path, lat_val, lon_val)
     if cached_geo:
-        return cached_geo, "GPS Cache (DB)"
+        return cached_geo, "Cache (DB)"
 
     # Round to the nearest 0.0002 (approx 22-meter accuracy)
     lat_bucket = round(lat_val * 5000) / 5000
@@ -239,7 +284,7 @@ async def reverse_geocode_async(lat, lon, geo_lock, console_lock, db_path):
         await in_flight[lock_bucket].wait()
         # Check DB again; the other task just filled it
         cached_geo = await asyncio.to_thread(get_cached_location, db_path, lat_val, lon_val)
-        return cached_geo, "GPS Cache (Waited)"
+        return cached_geo, "Cache (Waited)"
 
     # 3. If not cached and not in-flight, fetch it.
     event = asyncio.Event()
@@ -261,7 +306,7 @@ async def reverse_geocode_async(lat, lon, geo_lock, console_lock, db_path):
                         # exact coordinate to the database while we were waiting.
                         late_cache = get_cached_location(db_path, lat_val, lon_val)
                         if late_cache:
-                            return late_cache, "GPS Cache (Late)"
+                            return late_cache, "Cache (Late)"
 
                         # THE SMART SLEEP
                         now = time.time()
@@ -325,11 +370,11 @@ async def reverse_geocode_async(lat, lon, geo_lock, console_lock, db_path):
             
             # Save to SQLite Database
             await asyncio.to_thread(save_location_to_db, db_path, lat_val, lon_val, geo_data)
-            return geo_data, "GPS API"
+            return geo_data, "API"
                         
         except Exception as e:
             await safe_print(f"Geocoding error: {e}", console_lock)
-            return {}, "GPS Error"
+            return {}, "Error"
             
         finally:
             event.set()
@@ -342,12 +387,22 @@ async def reverse_geocode_async(lat, lon, geo_lock, console_lock, db_path):
 async def process_single_image(n, img_data, args, semaphore, locks, progress_stats, pbar, results_path, analytics_path, progress_path, geo_db_path):
     # The semaphore safely throttles how many tasks run this block simultaneously based on --workers
     async with semaphore:
+        # add a random delay, so that not too many connections are opened at the exact same time
+        await asyncio.sleep(random.uniform(0.0, 2.0))
+
         # Safely increment started count and update progress bar
         async with locks['stats']:
             progress_stats["started"] += 1
             try:
-                pbar.set_postfix(Started=progress_stats["started"], Done=progress_stats["done"])
-            except NameError:
+                # Calculate elapsed time and average speed based on completed items
+                elapsed = time.time() - pbar.start_t
+                avg_speed = progress_stats["done"] / elapsed if elapsed > 0 else 0
+                avg_str = f"Avg: {avg_speed:.2f}img/s" if progress_stats["done"] > 0 else "Avg: ?img/s"
+                
+                # Dynamically re-write the progress bar string layout
+                pbar.bar_format = f"{{l_bar}}{{bar}}| {{n_fmt}}/{{total_fmt}} ({progress_stats['started']}) [{{elapsed}}<{{remaining}}, Cur: {{rate_noinv_fmt}}, {avg_str}]"
+                pbar.refresh()
+            except Exception:
                 pass # Failsafe in case the thread executes before pbar is fully bound
 
         image_path = img_data['ImagePath']
@@ -364,7 +419,7 @@ async def process_single_image(n, img_data, args, semaphore, locks, progress_sta
 
         address = ""
         city, state, country = "", "", ""
-        geo_note = "GPS Skipped"
+        geo_note = "Skipped"
         
         # STRICT CHECK: Only skip if the FULL address (Sublocation) is already filled out
         has_full_address = bool(existing_loc)
@@ -376,7 +431,7 @@ async def process_single_image(n, img_data, args, semaphore, locks, progress_sta
             city = existing_city
             state = existing_state
             country = existing_country
-            geo_note = "GPS Skipped (Address exists)"
+            geo_note = "Skipped (Address exists)"
             
         # 2. Otherwise, check if we should query the Geocoding API
         elif args.geocode == 1:
@@ -406,7 +461,7 @@ async def process_single_image(n, img_data, args, semaphore, locks, progress_sta
                 state = existing_state
                 country = existing_country
                 address = ", ".join(filter(None, [city, state, country]))
-                geo_note = "GPS Fallback (Used partial data)"
+                geo_note = "Fallback (Partial data)"
                 
         # 4. GEO DISABLED SCENARIO: Geocoding is off, but we have partial data
         elif existing_city or existing_country:
@@ -414,12 +469,12 @@ async def process_single_image(n, img_data, args, semaphore, locks, progress_sta
             state = existing_state
             country = existing_country
             address = ", ".join(filter(None, [city, state, country]))
-            geo_note = "GPS Skipped (Used partial data)"
+            geo_note = "Skipped (Partial data)"
 
         attempt = 0
         answer = {}
         llm_retry_reasons = []
-        keyword_note = "Keywords OK"
+        keyword_note = "OK"
         successful_seed = config.SEEDS[0]
         
         for seed in config.SEEDS:
@@ -432,14 +487,39 @@ async def process_single_image(n, img_data, args, semaphore, locks, progress_sta
             #     await safe_print(f"[{img_data['Filename']}] Attempt #{attempt} with seed {seed}", locks['console']) # Commented out standard attempt 1
 
             answer = await analyze_image(image_path, seed, date_time, address)
+            
+            # --- OPTIONAL: SAVE RAW RESPONSE TO FILE ---
+            # We use getattr() as a failsafe just in case you forget to add it to config.py
+            if getattr(config, 'LOG_RAW_RESPONSES', 0) == 1 and answer.get('raw_dump'):
+                raw_log_path = os.path.join(args.batch_dir, "raw_responses.txt")
+                async with locks['file']:
+                    with open(raw_log_path, 'a', encoding='utf-8') as rf:
+                        rf.write(f"\n\n{'='*60}\nFILE: {image_path} | SEED: {seed} | ATTEMPT: {attempt}\n{'='*60}\n")
+                        rf.write(answer['raw_dump'])
+            # -------------------------------------------
+            
             keywords = answer.get('Keywords', [])
-
-            # Track if the LLM function caught a JSON format error
+            
             if "Error" in answer.get('Notes', ''):
-                llm_retry_reasons.append("JSON Error")
-                await safe_print(f"[{image_path}] JSON parsing failed. Retrying with new seed...", locks['console'])
-                continue # Add this to skip keyword checks on a JSON failure
+                error_msg = str(answer.get('Notes', ''))
                 
+                # Clean the raw error so it fits perfectly into ONE Excel cell!
+                safe_error = sanitize_for_tsv(error_msg)
+                
+                # 1. Catch physical network drops, offline servers, or timeouts
+                if any(x in error_msg for x in ["ConnectError", "Connection", "Timeout", "500"]):
+                    llm_retry_reasons.append(f"Server Offline: {safe_error}")
+                    await safe_print(f"[{image_path}] Network/Server error. Pausing this worker for 5s...", locks['console'])
+                    await asyncio.sleep(5.0) 
+                    continue 
+                    
+                # 2. Standard JSON formatting failure (Safe to retry instantly)
+                else:
+                    # Append the full, sanitized raw text directly to the TSV Notes!
+                    llm_retry_reasons.append(safe_error)
+                    await safe_print(f"[{image_path}] JSON parsing failed. Retrying instantly with new seed...", locks['console'])
+                    continue
+                                
             # Since JSON formatting is strictly guaranteed now, we only need to check keyword count rules
             if len(keywords) < config.MIN_KEYWORDS:
                 llm_retry_reasons.append(f"Low Keywords ({len(keywords)})")
@@ -451,36 +531,32 @@ async def process_single_image(n, img_data, args, semaphore, locks, progress_sta
                 shorter_keywords = await summarize_keywords('; '.join(keywords), seed)
                 keywords_str = shorter_keywords['Keywords'].strip()
                 keywords = [k.strip() for k in keywords_str.split(';')]
-                keyword_note = "Keywords Shortened"
+                keyword_note = "Shortened"
                 attempt *= 10 
 
-            # If we made it here and have a valid token count, we have a successful generation!
-            if answer.get('Completion tokens', 0) < config.MAX_TOKENS:
+            # Get the current profile's exact token limit (checking both standard and OpenAI names)
+            profile_limit = active_profile["api_params"].get("max_tokens", active_profile["api_params"].get("max_completion_tokens", config.MAX_TOKENS))
+
+            # If we made it here and didn't hit the ceiling, we have a successful generation!
+            if answer.get('Completion tokens', 0) < profile_limit:
                 successful_seed = seed
                 break
             else:
                 llm_retry_reasons.append("Max Tokens Hit")
 
-        # Compile the final notes string
-        final_notes_list = [geo_note]
-        
+        # Format the LLM status
         if not llm_retry_reasons:
-            final_notes_list.append("LLM OK (1st Try)")
+            llm_status = "OK"
         else:
-            final_notes_list.append("LLM Retries: [" + ", ".join(llm_retry_reasons) + "]")
-            
-        final_notes_list.append(keyword_note)
-        final_notes_list.append(f"Seed: {successful_seed}")
-        
-        final_notes_str = "; ".join(final_notes_list)
-                
-        clean_title = str(answer.get('Title', '')).replace('\t', ' ').replace('\n', ' ')
-        clean_desc = str(answer.get('Description', '')).replace('\t', ' ').replace('\n', ' ')
-        clean_keywords = ";".join(keywords).replace('\t', ' ').replace('\n', ' ')
-        clean_address = str(address).replace('\t', ' ').replace('\n', ' ')
-        clean_city = str(city).replace('\t', ' ').replace('\n', ' ')
-        clean_state = str(state).replace('\t', ' ').replace('\n', ' ')
-        clean_country = str(country).replace('\t', ' ').replace('\n', ' ')
+            llm_status = ", ".join(llm_retry_reasons)
+                        
+        clean_title = sanitize_for_tsv(answer.get('Title', ''))
+        clean_desc = sanitize_for_tsv(answer.get('Description', ''))
+        clean_keywords = sanitize_for_tsv("; ".join(keywords))
+        clean_address = sanitize_for_tsv(address)
+        clean_city = sanitize_for_tsv(city)
+        clean_state = sanitize_for_tsv(state)
+        clean_country = sanitize_for_tsv(country)
         
         current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -501,20 +577,29 @@ async def process_single_image(n, img_data, args, semaphore, locks, progress_sta
                 f.write(f"{photo_id}\t{clean_title}\t{clean_desc}\t{clean_keywords}\t{model_with_date}\t{clean_address}\t{clean_city}\t{clean_state}\t{clean_country}\n")
 
             with open(analytics_path, 'a', encoding='utf-8') as tsv_file:
-                tsv_file.write(f"{image_path}\t{formatted_time}\t{date_time}\t{lat}\t{lon}\t{address}\t")
+                tsv_file.write(f"{photo_id}\t{image_path}\t{formatted_time}\t{date_time}\t{lat}\t{lon}\t{address}\t")
                 tsv_file.write(f"{llm_model}\t{attempt}\t{answer.get('Prompt tokens', 0)}\t{answer.get('Completion tokens', 0)}\t{len(keywords)}\t{elapsed_time:.2f}\t")
-                tsv_file.write(f"{clean_title}\t{clean_desc}\t{clean_keywords}\t{final_notes_str}\n")        
-
+                tsv_file.write(f"{geo_note}\t{llm_status}\t{keyword_note}\t{successful_seed}\t{clean_title}\t{clean_desc}\t{clean_keywords}\n")
+            
         # Update final UI stats using the async lock
         async with locks['stats']:
             progress_stats["done"] += 1
-            pbar.update(1)
-            pbar.set_postfix(Started=progress_stats["started"], Done=progress_stats["done"])
             
+            try:
+                # Recalculate average speed upon completion
+                elapsed = time.time() - pbar.start_t
+                avg_speed = progress_stats["done"] / elapsed if elapsed > 0 else 0
+                avg_str = f"Avg: {avg_speed:.2f}img/s"
+                
+                pbar.bar_format = f"{{l_bar}}{{bar}}| {{n_fmt}}/{{total_fmt}} ({progress_stats['started']}) [{{elapsed}}<{{remaining}}, Cur: {{rate_noinv_fmt}}, {avg_str}]"
+            except Exception:
+                pass
+                
+            pbar.update(1)
+
             # Sync to Lightroom
             with open(progress_path, 'w') as pf:
                 pf.write(str(progress_stats["done"]))
-
 
 async def main_async(args, images_to_process, results_path, analytics_path, progress_path, geo_db_path):
     # Setup the Semaphore using the user's --workers argument
@@ -532,7 +617,7 @@ async def main_async(args, images_to_process, results_path, analytics_path, prog
     total_images = len(images_to_process)
 
     print(f"Starting parallel processing with {args.workers} concurrent async tasks...\n")
-    custom_format = "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_noinv_fmt}{postfix}]"
+    custom_format = "{l_bar}{bar}| {n_fmt}/{total_fmt} (0) [{elapsed}<{remaining}, Cur: {rate_noinv_fmt}, Avg: ?img/s]"
     
     with tqdm(total=total_images, desc="AI Annotator", unit="img", bar_format=custom_format) as pbar:
         # Create a list of all the tasks we want to run
@@ -589,7 +674,7 @@ def main():
 
     # Setup files
     with open(analytics_path, 'w', encoding='utf-8') as tsv_file:
-        tsv_file.write("Image Path\tProcessed on\tDate\tLatitude\tLongitude\tAddress\tLLM model\tAttempt\tPrompt tokens\tCompletion tokens\tNumber of keywords\tProcessing time\tTitle\tDescription\tKeywords\tNotes\n")
+        tsv_file.write("PhotoID\tImage Path\tProcessed on\tDate\tLatitude\tLongitude\tAddress\tLLM model\tAttempt\tPrompt tokens\tCompletion tokens\tNumber of keywords\tProcessing time\tGeo Source\tLLM Status\tKeyword Status\tSeed\tTitle\tDescription\tKeywords\n")
 
     with open(results_path, 'w', encoding='utf-8') as f:
         f.write("PhotoID\tTitle\tDescription\tKeywords\tModel\tAddress\tCity\tState\tCountry\n")
